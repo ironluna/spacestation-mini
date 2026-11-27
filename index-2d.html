@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>像素空间站 · 体素实时旋转 Demo</title>
+<link rel="icon" href="data:,">
+<style>
+ body{margin:0;background:#0a0b12;color:#cfd3e0;font:13px/1.6 Consolas,'Courier New',monospace;display:flex;flex-direction:column;align-items:center;padding:16px}
+ h1{font-size:16px;margin:6px 0 2px;color:#ffd75e;letter-spacing:2px}
+ .sub{color:#7a8194;margin-bottom:10px;font-size:12px}
+ #view{width:720px;height:630px;image-rendering:pixelated;background:#000;border:2px solid #2a2f42;cursor:crosshair;touch-action:none}
+ .panel{display:flex;gap:6px;margin:10px 0;flex-wrap:wrap;justify-content:center;width:720px}
+ button{background:#171a26;color:#cfd3e0;border:1px solid #343b55;padding:5px 10px;cursor:pointer;font:inherit}
+ button.sel{border-color:#ffd75e;color:#ffd75e;background:#22200f}
+ .sw{display:inline-block;width:10px;height:10px;margin-right:5px;vertical-align:-1px}
+ .hint{color:#7a8194;font-size:12px;width:720px;text-align:center}
+ .hint b{color:#9fd0ff;font-weight:normal}
+ #stat{color:#5a6172;font-size:11px;margin-top:6px}
+</style>
+</head>
+<body>
+<h1>◈ 像素空间站 · 低分辨率体素实时旋转 ◈</h1>
+<div class="sub">渲染目标 240×210 → 最近邻放大3倍 | 画家算法深度排序 + 阴影量化 + 世界空间光照</div>
+<canvas id="view" width="240" height="210"></canvas>
+<div class="panel" id="modPanel"></div>
+<div class="hint">
+ <b>拖拽</b> 旋转视角　<b>滚轮</b> 缩放像素格　<b>左键</b> 在朝向相机的面放置模块　<b>Shift+左键</b> 拆除　<b>O</b> 描边开关　<b>空格</b> 暂停/恢复自转　<b>R</b> 重置空间站
+</div>
+<div id="stat"></div>
+<script>
+const BW=240,BH=210;
+const cv=document.getElementById('view'),ctx=cv.getContext('2d');
+const TYPES={
+ 1:{n:'桁架',c:[150,154,166]},
+ 2:{n:'居住舱',c:[232,232,242]},
+ 3:{n:'太阳能板',c:[70,100,220]},
+ 4:{n:'散热板',c:[220,210,180]},
+ 5:{n:'天线',c:[240,200,60]},
+ 6:{n:'对接口/信标',c:[220,90,70]},
+};
+let VS=7;                 // 每个体素占多少渲染像素（缩放档位）
+let outline=true;         // 是否显示模块描边
+let yaw=0.6,pitch=0.35,autoRot=true;
+let cosA=1,sinA=0,cosB=1,sinB=0;
+let voxels=[],keySet=new Set(),typeSel=1;
+const Lw0=[-0.4,0.65,-0.65];   // 太阳方向（世界空间，不随空间站转）
+
+// ---------- 旋转数学 ----------
+function updRot(){cosA=Math.cos(yaw);sinA=Math.sin(yaw);cosB=Math.cos(pitch);sinB=Math.sin(pitch);}
+function invRot(vx,vy,vz){const ty=vy*cosB+vz*sinB,tz=-vy*sinB+vz*cosB;return[vx*cosA-tz*sinA,ty,vx*sinA+tz*cosA];}
+
+// ---------- 背景：星空 + 抖动描边行星 ----------
+const bg=document.createElement('canvas');bg.width=BW;bg.height=BH;
+(function(){
+ const b=bg.getContext('2d');
+ b.fillStyle='#04050c';b.fillRect(0,0,BW,BH);
+ const img=b.getImageData(0,0,BW,BH),d=img.data;
+ const BAY=[[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]];
+ const px=-20,py=BH+30,r=95;
+ for(let y=Math.max(0,py-r-6);y<BH;y++)for(let x=0;x<Math.min(BW,px+r+6);x++){
+  const dx=x-px,dy=y-py,dist=Math.hypot(dx,dy);
+  const i=(y*BW+x)*4;
+  if(dist<r){
+   const band=Math.sin(y*0.16+Math.sin(x*0.06)*2.2);
+   let cr=30,cg=48,cb=104;
+   if(band>0.4){cr=42;cg=70;cb=146;}
+   if(band>0.88){cr=72;cg=100;cb=176;}
+   if(dist>r-3){const k=(dist-(r-3))/3;cr=cr+(115-cr)*k;cg=cg+(155-cg)*k;cb=cb+(245-cb)*k;}
+   d[i]=cr;d[i+1]=cg;d[i+2]=cb;d[i+3]=255;
+  }else if(dist<r+5){
+   const a=(r+5-dist)/5;
+   if(a>BAY[y&3][x&3]/16){d[i]=70*a|0;d[i+1]=110*a|0;d[i+2]=215*a|0;d[i+3]=255;}
+  }
+ }
+ b.putImageData(img,0,0);
+ for(let k=0;k<130;k++){
+  const x=(Math.random()*BW)|0,y=(Math.random()*BH)|0,m=Math.random();
+  const col=m<0.6?'#ffffff':m<0.78?'#9fb8ff':m<0.9?'#ffd9a0':'#7fe3ff';
+  b.fillStyle=col;
+  if(m>0.97){b.fillRect(x-1,y,3,1);b.fillRect(x,y-1,1,3);}else b.fillRect(x,y,1,1);
+ }
+})();
+
+// ---------- 空间站数据（体素网格） ----------
+function k3(x,y,z){return x+','+y+','+z}
+function addV(x,y,z,t){const k=k3(x,y,z);if(!keySet.has(k)){keySet.add(k);voxels.push({x,y,z,t});}}
+function delV(v){keySet.delete(k3(v.x,v.y,v.z));voxels=voxels.filter(o=>o!==v);}
+function buildDefault(){
+ voxels=[];keySet=new Set();
+ for(let x=-9;x<=9;x++)addV(x,0,0,1);                                    // 主桁架
+ for(let x=-1;x<=1;x++)for(let y=-1;y<=1;y++)for(let z=-1;z<=1;z++)addV(x,y,z,2);  // 中央居住舱
+ for(const sx of[-1,1]){
+  for(let z=-5;z<=5;z++)addV(sx*6,1,z,3);                                // 主太阳翼
+  for(let z=-3;z<=3;z++)addV(sx*8,-1,z,3);                               // 副太阳翼
+  addV(sx*3,1,0,1);                                                      // 散热板支杆
+  for(let y=1;y<=3;y++){addV(sx*3,y,1,4);addV(sx*3,y,-1,4);}             // 散热板
+ }
+ for(let y=2;y<=4;y++)addV(0,y,0,5);                                     // 通讯主桅
+ addV(-1,4,0,5);addV(1,4,0,5);addV(0,4,1,5);addV(0,4,-1,5);addV(0,5,0,5);
+ addV(0,6,0,6);                                                          // 桅顶信标
+ addV(0,0,2,1);addV(0,0,3,1);addV(0,0,4,6);                              // 对接口 +Z
+ addV(0,0,-2,1);addV(0,0,-3,1);addV(0,0,-4,6);                           // 对接口 -Z
+ addV(4,1,0,1);addV(4,2,0,1);addV(4,2,1,1);addV(4,3,1,1);addV(4,3,2,1);addV(4,3,3,6);   // 机械臂 A
+ addV(-4,1,0,1);addV(-4,2,0,1);addV(-4,2,-1,1);addV(-4,3,-1,1);addV(-4,3,-2,1);addV(-4,4,-2,5); // 机械臂 B
+ addV(-7,1,0,5);addV(-7,2,0,5);addV(-7,3,0,6);                           // 小型通讯桅
+ addV(-6,-1,0,2);addV(-6,-2,0,2);addV(6,-1,0,2);addV(6,-2,0,2);          // 下挂居住舱
+ addV(9,1,0,6);addV(-9,1,0,6);                                           // 桁架端信标
+}
+
+// ---------- 渲染 ----------
+const statEl=document.getElementById('stat');
+let camDir=[0,0,1],fc=0;
+function render(){
+ updRot();
+ camDir=invRot(0,0,1);
+ const L=invRot(Lw0[0],Lw0[1],Lw0[2]);
+ const ln=Math.hypot(L[0],L[1],L[2]);
+ const Ldir=[L[0]/ln,L[1]/ln,L[2]/ln];
+ ctx.drawImage(bg,0,0);
+ const cx=BW/2,cy=BH/2+4,s=VS;
+ // 画家算法：按视深排序，远→近绘制
+ const items=[];
+ for(const v of voxels){
+  const x1=v.x*cosA+v.z*sinA,z1=-v.x*sinA+v.z*cosA;
+  const y2=v.y*cosB-z1*sinB,z2=v.y*sinB+z1*cosB;
+  items.push([z2,v,x1,y2]);
+ }
+ items.sort((a,b)=>b[0]-a[0]);
+ // 朝向相机的面（全体素一致）→ 用法线与太阳方向点积求阴影
+ const ac=[Math.abs(camDir[0]),Math.abs(camDir[1]),Math.abs(camDir[2])];
+ const ai=ac.indexOf(Math.max(ac[0],ac[1],ac[2]));
+ const nsign=camDir[ai]>=0?1:-1;
+ const diff=Math.max(0,Ldir[ai]*nsign);
+ const shade=Math.min(1.15,Math.round((0.30+0.85*diff)*3)/3);
+ const cache={};
+ for(const it of items){
+  const v=it[1];
+  const ck=v.t+'_'+shade;
+  let col=cache[ck];
+  if(!col){
+   const c=TYPES[v.t].c;
+   col='rgb('+Math.min(255,c[0]*shade|0)+','+Math.min(255,c[1]*shade|0)+','+Math.min(255,c[2]*shade|0)+')';
+   cache[ck]=col;
+  }
+  const px=Math.round(cx+it[2]*s-s/2),py=Math.round(cy-it[3]*s-s/2);
+  if(outline){
+   // 先画整块深色底，再画缩进1px的本体色 → 形成1px描边
+   const ok='o'+v.t;
+   let ol=cache[ok];
+   if(!ol){const c=TYPES[v.t].c;ol='rgb('+(c[0]*0.30|0)+','+(c[1]*0.30|0)+','+(c[2]*0.30|0)+')';cache[ok]=ol;}
+   ctx.fillStyle=ol;ctx.fillRect(px,py,s+1,s+1);
+   ctx.fillStyle=col;ctx.fillRect(px+1,py+1,s-1,s-1);
+  }else{
+   ctx.fillStyle=col;ctx.fillRect(px,py,s+1,s+1);
+  }
+ }
+ if((fc++%15)===0)statEl.textContent='模块数: '+voxels.length+' | 体素像素: '+VS+'px | 渲染分辨率: '+BW+'×'+BH;
+}
+function tick(){
+ if(autoRot){yaw+=0.006;}
+ render();
+ requestAnimationFrame(tick);
+}
+
+// ---------- 拾取（从最前面的体素开始找） ----------
+function pick(mx,my){
+ const cx=BW/2,cy=BH/2+4,s=VS;
+ const items=[];
+ for(const v of voxels){
+  const x1=v.x*cosA+v.z*sinA,z1=-v.x*sinA+v.z*cosA;
+  const y2=v.y*cosB-z1*sinB,z2=v.y*sinB+z1*cosB;
+  items.push([z2,v,cx+x1*s,cy-y2*s]);
+ }
+ items.sort((a,b)=>b[0]-a[0]);
+ for(let i=items.length-1;i>=0;i--){
+  const it=items[i];
+  if(Math.abs(it[2]-mx)<s/2+1&&Math.abs(it[3]-my)<s/2+1)return it[1];
+ }
+ return null;
+}
+
+// ---------- 交互 ----------
+let dragging=false,moved=0,lmx=0,lmy=0;
+cv.addEventListener('pointerdown',e=>{dragging=true;moved=0;lmx=e.clientX;lmy=e.clientY;cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointermove',e=>{
+ if(!dragging)return;
+ const dx=e.clientX-lmx,dy=e.clientY-lmy;
+ moved+=Math.abs(dx)+Math.abs(dy);
+ yaw+=dx*0.008;
+ pitch=Math.max(-1.2,Math.min(1.2,pitch+dy*0.008));
+ lmx=e.clientX;lmy=e.clientY;
+});
+cv.addEventListener('pointerup',e=>{
+ dragging=false;
+ if(moved>=6)return;
+ updRot();
+ const rect=cv.getBoundingClientRect();
+ const mx=(e.clientX-rect.left)/rect.width*BW,my=(e.clientY-rect.top)/rect.height*BH;
+ const hit=pick(mx,my);
+ if(!hit)return;
+ if(e.shiftKey){delV(hit);return;}
+ if(voxels.length>=2500)return;
+ camDir=invRot(0,0,1);
+ const ac=[Math.abs(camDir[0]),Math.abs(camDir[1]),Math.abs(camDir[2])];
+ const ai=ac.indexOf(Math.max(ac[0],ac[1],ac[2]));
+ const off=[0,0,0];off[ai]=camDir[ai]>=0?1:-1;
+ addV(hit.x+off[0],hit.y+off[1],hit.z+off[2],typeSel);
+});
+cv.addEventListener('wheel',e=>{e.preventDefault();VS=Math.max(3,Math.min(10,VS+(e.deltaY>0?-1:1)));},{passive:false});
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+window.addEventListener('keydown',e=>{
+ if(e.key>='1'&&e.key<='6')setType(+e.key);
+ else if(e.key===' '){autoRot=!autoRot;syncBtns();e.preventDefault();}
+ else if(e.key==='o'||e.key==='O'){outline=!outline;syncBtns();}
+ else if(e.key==='r'||e.key==='R'){buildDefault();}
+});
+
+// ---------- 模块选择 UI ----------
+const panel=document.getElementById('modPanel');
+function setType(t){typeSel=t;syncBtns();}
+function syncBtns(){
+ document.querySelectorAll('#modPanel button[data-t]').forEach(b=>b.classList.toggle('sel',+b.dataset.t===typeSel));
+ bP.textContent='自转:'+(autoRot?'开':'停')+'(空格)';
+ bO.textContent='描边:'+(outline?'开':'关')+'(O)';
+}
+for(let t=1;t<=6;t++){
+ const b=document.createElement('button');b.dataset.t=t;
+ b.innerHTML='<span class="sw" style="background:rgb('+TYPES[t].c.join(',')+')"></span>'+t+'·'+TYPES[t].n;
+ b.onclick=()=>setType(t);panel.appendChild(b);
+}
+const bR=document.createElement('button');bR.textContent='重置(R)';bR.onclick=buildDefault;panel.appendChild(bR);
+const bP=document.createElement('button');bP.onclick=()=>{autoRot=!autoRot;syncBtns();};panel.appendChild(bP);
+const bO=document.createElement('button');bO.onclick=()=>{outline=!outline;syncBtns();};panel.appendChild(bO);
+
+buildDefault();updRot();setType(1);requestAnimationFrame(tick);
+</script>
+</body>
+</html>
