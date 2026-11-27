@@ -17,6 +17,12 @@
  .hint{color:#7a8194;font-size:12px;width:720px;text-align:center}
  .hint b{color:#9fd0ff;font-weight:normal}
  #stat{color:#5a6172;font-size:11px;margin-top:6px}
+ #radio{position:absolute;right:10px;bottom:10px;width:206px;background:rgba(6,9,18,.84);border:1px solid #27304a;border-left:2px solid #ffd75e;padding:7px 9px 8px;font-size:11px;line-height:1.6;color:#c9d4e8;opacity:0;transform:translateY(6px);transition:opacity .22s ease,transform .22s ease;pointer-events:none;cursor:pointer}
+ #radio.show{opacity:1;transform:translateY(0);pointer-events:auto}
+ #radio .hd{display:flex;justify-content:space-between;align-items:center;color:#7d8aa6;font-size:10px;letter-spacing:.5px;margin-bottom:4px}
+ #radio .tag{color:#ffd75e}
+ #radio .tag.ai{color:#9fd0ff}
+ #radio .tx{min-height:3.2em;white-space:pre-wrap;overflow-wrap:break-word;color:#d6e0f2}
 </style>
 </head>
 <body>
@@ -26,10 +32,14 @@
   <canvas id="bg" width="240" height="210"></canvas>
   <canvas id="view" width="240" height="210"></canvas>
   <canvas id="flare" width="240" height="210"></canvas>
+  <div id="radio">
+    <div class="hd"><span>◉ 轨道电台 · 07.4 MHz</span><span class="tag" id="radioTag">航天</span></div>
+    <div class="tx" id="radioTx"></div>
+  </div>
 </div>
 <div class="panel" id="modPanel"></div>
 <div class="hint">
- <b>拖拽</b> 旋转视角　<b>滚轮</b> 缩放　<b>左键</b> 在命中面外侧放置模块　<b>Shift+左键</b> 拆除　<b>O</b> 描边开关　<b>F</b> 光效开关　<b>空格</b> 暂停/恢复自转　<b>R</b> 重置空间站
+ <b>拖拽</b> 旋转视角　<b>滚轮</b> 缩放　<b>左键</b> 放置模块　<b>Shift+左键</b> 拆除　<b>O</b> 描边　<b>F</b> 光效　<b>空格</b> 暂停自转　<b>R</b> 重置　每放置 10 块电台播报一条简报
 </div>
 <div id="stat"></div>
 
@@ -411,6 +421,7 @@ function delIdx(i) {
 // ---------- 默认空间站（坐标与 2D 版完全一致） ----------
 function buildDefault() {
   voxels.length = 0; indexOf.clear(); mesh.count = 0; hull.count = 0;
+  placedCount = 0;
   for (let x = -9; x <= 9; x++) addV(x, 0, 0, 1);                                     // 主桁架
   for (let x = -1; x <= 1; x++) for (let y = -1; y <= 1; y++) for (let z = -1; z <= 1; z++) addV(x, y, z, 2); // 中央居住舱
   for (const sx of [-1, 1]) {
@@ -466,10 +477,120 @@ function updateHover(e) {
   hover = { instanceId: h.instanceId, cell, free };
 }
 
+// ================= 轨道电台：每放置 10 块播一条地面简报 =================
+// 文本取自 2026 年 11 月的公开报道，只保留事实陈述，不含评价与立场。
+const NEWS = [
+  { tag: '航天', t: '地面简报：神舟二十四号载人飞船 11 月 25 日从酒泉发射升空。' },
+  { tag: '航天', t: '地面简报：遥感四十九号 01 组卫星 11 月 26 日由长征二号丁送入轨道。' },
+  { tag: '航天', t: '地面简报：欧日联合探测器 BepiColombo 11 月 21 日进入水星轨道。' },
+  { tag: '航天', t: '地面简报：阿丽亚娜 6 号 11 月 24 日将一批低轨通信卫星送入轨道。' },
+  { tag: '航天', t: '地面简报：星舰完成第 15 次试飞，飞船入轨，助推器回收未按计划。' },
+  { tag: '航天', t: '地面简报：NASA 的 Terra 卫星将于 12 月 1 日停止采集科学数据。' },
+  { tag: '航天', t: '地面简报：ESCAPADE 双探测器 11 月 7 日、9 日先后掠过地球。' },
+  { tag: 'AI', t: '地面简报：谷歌发布多模态模型 Gemini 4 Carbon。' },
+  { tag: 'AI', t: '地面简报：Anthropic 发布 Claude Fable 与 Mythos 5.2。' },
+  { tag: 'AI', t: '地面简报：DeepSeek 开放应用全家桶 API。' },
+  { tag: 'AI', t: '地面简报：OpenAI 推出 ChatGPT Wallet，支持智能体代付。' },
+  { tag: 'AI', t: '地面简报：小鹏发布图灵世界模型 WorldGPT。' },
+  { tag: 'AI', t: '地面简报：腾讯混元开源第三代翻译模型 HyMT3。' },
+  { tag: 'AI', t: '地面简报：商汤开源 SenseNova U1.6。' },
+  { tag: 'AI', t: '地面简报：Meta 推出轻量级智能体模型 Muse Ember。' },
+  { tag: 'AI', t: '地面简报：豆包个人助理“小豆”开启邀请制公测。' },
+];
+
+const radioEl = document.getElementById('radio');
+const radioTag = document.getElementById('radioTag');
+const radioTx = document.getElementById('radioTx');
+let placedCount = 0;
+let newsBag = [];
+const radioState = { q: [], playing: false, timer: 0 };
+
+function nextNews() {
+  if (!newsBag.length) {
+    newsBag = NEWS.slice();
+    for (let i = newsBag.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      const tmp = newsBag[i]; newsBag[i] = newsBag[j]; newsBag[j] = tmp;
+    }
+  }
+  return newsBag.pop();
+}
+
+// 短促的无线电提示音：方波载波 + 带通噪声，全部现场合成
+let audioCtx = null;
+function radioBlip() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const t0 = audioCtx.currentTime;
+
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(1180, t0);
+    osc.frequency.exponentialRampToValueAtTime(720, t0 + 0.16);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.055, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.2);
+    osc.connect(g); g.connect(audioCtx.destination);
+    osc.start(t0); osc.stop(t0 + 0.22);
+
+    const dur = 0.24;
+    const buf = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * dur), audioCtx.sampleRate);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < ch.length; i++) ch[i] = (Math.random() * 2 - 1) * 0.6;
+    const src = audioCtx.createBufferSource(); src.buffer = buf;
+    const bp = audioCtx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 2300; bp.Q.value = 0.7;
+    const g2 = audioCtx.createGain();
+    g2.gain.setValueAtTime(0.0001, t0);
+    g2.gain.exponentialRampToValueAtTime(0.05, t0 + 0.02);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    src.connect(bp); bp.connect(g2); g2.connect(audioCtx.destination);
+    src.start(t0);
+  } catch (_) { /* 没有音频权限或设备时静默 */ }
+}
+
+function onPlaced() {
+  placedCount++;
+  if (placedCount % 10 !== 0) return;
+  if (radioState.q.length >= 3) radioState.q.shift();   // 积压时丢最旧的，避免刷屏
+  radioState.q.push(nextNews());
+  if (!radioState.playing) playNews();
+}
+
+function playNews() {
+  const item = radioState.q.shift();
+  if (!item) { radioState.playing = false; radioEl.classList.remove('show'); return; }
+  radioState.playing = true;
+  radioTag.textContent = item.tag;
+  radioTag.className = 'tag' + (item.tag === 'AI' ? ' ai' : '');
+  radioTx.textContent = '';
+  radioEl.classList.add('show');
+  radioBlip();
+
+  clearTimeout(radioState.timer);
+  let i = 0;
+  const step = () => {
+    radioTx.textContent = item.t.slice(0, ++i);
+    if (i < item.t.length) radioState.timer = setTimeout(step, 34);
+    else radioState.timer = setTimeout(hideNews, 4200);
+  };
+  step();
+}
+
+function hideNews() {
+  clearTimeout(radioState.timer);
+  radioEl.classList.remove('show');
+  radioState.timer = setTimeout(playNews, 420);   // 队列里还有就接着播
+}
+radioEl.addEventListener('click', hideNews);
+
 // ---------- 交互 ----------
+
 let dragging = false, moved = 0, lx = 0, ly = 0, typeSel = 1;
 
 stage.addEventListener('pointerdown', e => {
+  if (e.target.closest('#radio')) return;                 // 点资讯框不算操作场景
   dragging = true; moved = 0; lx = e.clientX; ly = e.clientY;
   try { stage.setPointerCapture(e.pointerId); } catch (_) { /* 合成事件可能没有有效 pointerId */ }
   hideCursors();
@@ -485,6 +606,7 @@ stage.addEventListener('pointermove', e => {
 });
 
 stage.addEventListener('pointerup', e => {
+  if (e.target.closest('#radio')) return;
   const wasDrag = moved >= 6;
   dragging = false;
   if (wasDrag) { updateHover(e); return; }
@@ -498,7 +620,7 @@ stage.addEventListener('pointerup', e => {
     delIdx(h.instanceId);
   } else if (!indexOf.has(K(cell.x, cell.y, cell.z))) {
     if (voxels.length >= MAX) { statEl.textContent = '已达上限 ' + MAX + ' 块'; return; }
-    addV(cell.x, cell.y, cell.z, typeSel);
+    if (addV(cell.x, cell.y, cell.z, typeSel)) onPlaced();
   }
   updateHover(e);
 });
@@ -554,7 +676,7 @@ function tick() {
   drawFlare();                                    // 2D 叠层：阳光光芒与鬼影
 
   if ((fc++ % 15) === 0) {
-    statEl.textContent = '模块数: ' + voxels.length + ' | 体素像素: ' + (PX * zoom).toFixed(1) + 'px | 渲染分辨率: ' + BW + '×' + BH + ' | three r' + THREE.REVISION;
+    statEl.textContent = '模块数: ' + voxels.length + ' | 体素像素: ' + (PX * zoom).toFixed(1) + 'px | 渲染分辨率: ' + BW + '×' + BH + ' | 距下条简报 ' + (10 - placedCount % 10) + ' 块 | three r' + THREE.REVISION;
   }
   requestAnimationFrame(tick);
 }
