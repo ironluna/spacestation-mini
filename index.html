@@ -262,7 +262,7 @@ stage.addEventListener('pointermove', e => {
   if (!dragging) { updateHover(e); return; }
   const dx = e.clientX - lx, dy = e.clientY - ly;
   moved += Math.abs(dx) + Math.abs(dy);
-  yaw += dx * 0.008;
+  yaw -= dx * 0.008;   // 取反：鼠标向右拖 → 相机向左绕行 → 模型跟着向右转
   pitch = Math.max(-1.2, Math.min(1.2, pitch + dy * 0.008));
   lx = e.clientX; ly = e.clientY;
 });
